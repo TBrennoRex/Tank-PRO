@@ -1,0 +1,6 @@
+winrt-Windows.Devices.Midi==3.2.1
+winrt-Windows.Devices.Enumeration==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Foundation.Metadata==3.2.1
+winrt-Windows.Security.Cryptography==3.2.1
