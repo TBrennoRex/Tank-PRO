@@ -1,0 +1,208 @@
+name: Static M-UPGRADE analysis
+
+on:
+  push:
+    branches:
+      - "analysis/mupgrade-static"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract package
+        shell: bash
+        run: |
+          set -e
+          unzip -o M-UPGRADE_CORE.zip -d extracted
+          find extracted -maxdepth 3 -type f -printf '%p %s bytes\n' | sort > file_list.txt
+
+      - name: Analyze EXE and logs
+        shell: bash
+        run: |
+          python3 -m pip install --disable-pip-version-check pefile capstone
+          cat > analyze.py <<'PY'
+          import os, re, hashlib, struct, zipfile
+          from pathlib import Path
+          import pefile
+          from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_MODE_32
+
+          root = Path("extracted")
+          exe = root / "M-UPGRADE.exe"
+          out = Path("analysis")
+          out.mkdir(exist_ok=True)
+
+          data = exe.read_bytes()
+          (out/"hashes.txt").write_text(
+              "M-UPGRADE.exe size=%d\nSHA256=%s\nMD5=%s\n"
+              % (len(data), hashlib.sha256(data).hexdigest(), hashlib.md5(data).hexdigest())
+          )
+
+          def ascii_strings(b, n=4):
+              return [(m.start(), m.group().decode("ascii", "ignore"))
+                      for m in re.finditer(rb"[ -~]{%d,}" % n, b)]
+
+          def utf16_strings(b, n=4):
+              pat = rb"(?:[ -~]\x00){%d,}" % n
+              out2 = []
+              for m in re.finditer(pat, b):
+                  try:
+                      s = m.group().decode("utf-16le", "ignore")
+                      if s:
+                          out2.append((m.start(), s))
+                  except Exception:
+                      pass
+              return out2
+
+          astr = ascii_strings(data)
+          ustr = utf16_strings(data)
+          with (out/"strings_all.txt").open("w", encoding="utf-8", errors="ignore") as f:
+              for off,s in astr:
+                  f.write(f"ASCII 0x{off:X} {s}\n")
+              for off,s in ustr:
+                  f.write(f"UTF16 0x{off:X} {s}\n")
+
+          keys = re.compile(
+              r"midi|sysex|sys\s*ex|ota|upgrade|firmware|KPT|TANK|PRO|Sinco|"
+              r"E0000000|000000E0|0xE0000000|midiOut|midiIn|shortmsg|longmsg|"
+              r"ack|nak|checksum|crc|verify|boot|loader|DFU|device",
+              re.I
+          )
+          with (out/"strings_relevant.txt").open("w", encoding="utf-8") as f:
+              for off,s in astr + ustr:
+                  if keys.search(s):
+                      f.write(f"0x{off:X}\t{s}\n")
+
+          # Raw byte patterns for important constants/ASCII markers.
+          patterns = {
+              "E0000000_LE": bytes.fromhex("00 00 00 E0"),
+              "E0000000_BE": bytes.fromhex("E0 00 00 00"),
+              "midi": b"MIDI", "sysex": b"SysEx", "sinco": b"Sinco",
+              "kpt": b"KPT", "ota": b"OTA", "upgrade": b"upgrade"
+          }
+          with (out/"byte_hits.txt").open("w") as f:
+              for name,pat in patterns.items():
+                  poss=[]
+                  start=0
+                  while True:
+                      p=data.find(pat,start)
+                      if p<0: break
+                      poss.append(p); start=p+1
+                  f.write(f"{name}: {len(poss)} hits " + " ".join(hex(x) for x in poss[:200]) + "\n")
+
+          # PE metadata/imports.
+          pe = pefile.PE(str(exe), fast_load=False)
+          with (out/"pe_report.txt").open("w", encoding="utf-8", errors="ignore") as f:
+              f.write(f"Machine: 0x{pe.FILE_HEADER.Machine:X}\n")
+              f.write(f"ImageBase: 0x{pe.OPTIONAL_HEADER.ImageBase:X}\n")
+              f.write(f"EntryPoint RVA: 0x{pe.OPTIONAL_HEADER.AddressOfEntryPoint:X}\n")
+              f.write("Sections:\n")
+              for s in pe.sections:
+                  f.write(f"  {s.Name.rstrip(b'\\0').decode(errors='ignore')} "
+                          f"VA=0x{s.VirtualAddress:X} VSZ=0x{s.Misc_VirtualSize:X} "
+                          f"RAW=0x{s.PointerToRawData:X} RSZ=0x{s.SizeOfRawData:X}\n")
+              f.write("\nImports:\n")
+              try:
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      dll=entry.dll.decode(errors="ignore")
+                      f.write(f"[{dll}]\n")
+                      for imp in entry.imports:
+                          name = imp.name.decode(errors="ignore") if imp.name else f"ord_{imp.ordinal}"
+                          f.write(f"  {name} RVA=0x{imp.address-pe.OPTIONAL_HEADER.ImageBase:X}\n")
+              except Exception as e:
+                  f.write(f"IMPORT_PARSE_ERROR {e}\n")
+
+          # Disassemble text and dump contexts around references to relevant strings.
+          md = Cs(CS_ARCH_X86, CS_MODE_64 if pe.FILE_HEADER.Machine == 0x8664 else CS_MODE_32)
+          md.detail = True
+          text_sec = None
+          for s in pe.sections:
+              nm = s.Name.rstrip(b"\\0")
+              if nm == b".text":
+                  text_sec = s
+                  break
+          if text_sec:
+              code = text_sec.get_data()
+              va = pe.OPTIONAL_HEADER.ImageBase + text_sec.VirtualAddress
+              insns = list(md.disasm(code, va))
+              # Build RVA->string matches for relevant ASCII/UTF16 strings.
+              string_targets = []
+              for off,s in astr + ustr:
+                  if keys.search(s):
+                      rva = None
+                      for sec in pe.sections:
+                          raw0=sec.PointerToRawData; raw1=raw0+sec.SizeOfRawData
+                          if raw0 <= off < raw1:
+                              rva = sec.VirtualAddress + (off-raw0) + pe.OPTIONAL_HEADER.ImageBase
+                              break
+                      if rva:
+                          string_targets.append((rva,s,off))
+              refs=[]
+              for ins in insns:
+                  for op in ins.operands:
+                      target=None
+                      if op.type == 1:  # register
+                          continue
+                      if op.type == 2:  # immediate
+                          target=op.imm
+                      elif op.type == 3 and getattr(op.mem,"base",0) in (41,):
+                          target=ins.address + ins.size + op.mem.disp
+                      if target is not None:
+                          for rva,s,off in string_targets:
+                              if target == rva:
+                                  refs.append((ins.address,s,ins.mnemonic+" "+ins.op_str))
+              with (out/"code_string_refs.txt").open("w", encoding="utf-8", errors="ignore") as f:
+                  for addr,s,asm in refs[:1000]:
+                      f.write(f"0x{addr:X}\t{s}\t{asm}\n")
+              # Dump instruction windows around first 100 relevant references and constant hits.
+              refaddrs={a for a,_,_ in refs[:100]}
+              if text_sec:
+                  for name,pat in patterns.items():
+                      for off in [i for i in range(len(data)) if data.startswith(pat,i)][:20]:
+                          pass
+              with (out/"text_disassembly_relevant.txt").open("w", encoding="utf-8") as f:
+                  for addr,s,asm in refs[:100]:
+                      f.write(f"\n### reference 0x{addr:X} -> {s}\n")
+                      # find nearby instructions
+                      idx=next((i for i,x in enumerate(insns) if x.address==addr),None)
+                      if idx is not None:
+                          for x in insns[max(0,idx-18):idx+19]:
+                              f.write(f"0x{x.address:X}: {x.mnemonic} {x.op_str}\n")
+
+          # Log analysis.
+          logs=[]
+          for p in root.rglob("*"):
+              if p.is_file() and p.suffix.lower()==".log":
+                  try:
+                      t=p.read_text("utf-8","replace")
+                  except Exception:
+                      t=p.read_text(errors="replace")
+                  logs.append((p,t))
+          with (out/"logs_relevant.txt").open("w",encoding="utf-8") as f:
+              f.write(f"LOG FILES: {len(logs)}\n")
+              lk=re.compile(r"midi|sysex|ota|upgrade|firmware|KPT|TANK|E000|Sinco|"
+                            r"error|fail|success|ack|nak|checksum|verify|timeout|device", re.I)
+              for p,t in logs:
+                  f.write(f"\n===== {p} =====\n")
+                  lines=t.splitlines()
+                  for i,line in enumerate(lines,1):
+                      if lk.search(line):
+                          lo=max(0,i-2); hi=min(len(lines),i+2)
+                          for j in range(lo,hi+1):
+                              f.write(f"{j:6d}: {lines[j-1]}\n")
+          print("Analysis complete")
+          PY
+          python3 analyze.py
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mupgrade-static-analysis
+          path: |
+            file_list.txt
+            analysis/
+          if-no-files-found: error
