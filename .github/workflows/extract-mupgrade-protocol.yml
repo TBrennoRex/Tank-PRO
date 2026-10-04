@@ -1,0 +1,37 @@
+name: extract-mupgrade-protocol
+
+on:
+  push:
+    branches:
+      - analysis/extract-mupgrade-protocol
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract M-UPGRADE
+        shell: bash
+        run: |
+          set -e
+          mkdir -p extracted
+          unzip -q "m upgrade.zip" -d extracted
+          find extracted -type f -name 'M-UPGRADE.exe' -print
+          exe="$(find extracted -type f -name 'M-UPGRADE.exe' | head -1)"
+          test -n "$exe"
+          cp "$exe" extracted/M-UPGRADE.exe
+          sha256sum extracted/M-UPGRADE.exe > extracted/sha256.txt
+          objdump -x extracted/M-UPGRADE.exe > extracted/pe_headers.txt || true
+          objdump -d extracted/M-UPGRADE.exe > extracted/disasm.txt || true
+          strings -a -t x extracted/M-UPGRADE.exe > extracted/strings.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m-upgrade-protocol-analysis
+          path: |
+            extracted/M-UPGRADE.exe
+            extracted/sha256.txt
+            extracted/pe_headers.txt
+            extracted/disasm.txt
+            extracted/strings.txt
+          if-no-files-found: error
