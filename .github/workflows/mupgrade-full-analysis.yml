@@ -1,0 +1,177 @@
+name: Full M-UPGRADE analysis
+
+on:
+  push:
+    branches:
+      - "analysis/mupgrade-full"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract complete package
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile, shutil
+          z=zipfile.ZipFile("m upgrade.zip")
+          out=Path("mupgrade_full")
+          if out.exists(): shutil.rmtree(out)
+          out.mkdir()
+          for info in z.infolist():
+              safe=info.filename.replace("\\","/")
+              target=out/safe
+              target.parent.mkdir(parents=True, exist_ok=True)
+              if info.is_dir():
+                  target.mkdir(parents=True, exist_ok=True)
+              else:
+                  target.write_bytes(z.read(info))
+          print("entries:", len(z.infolist()))
+          print("compressed:", Path("m upgrade.zip").stat().st_size)
+          PY
+
+      - name: Static analysis
+        run: |
+          python3 -m pip install --disable-pip-version-check pefile capstone
+          cat > analyze.py <<'PY'
+          from pathlib import Path
+          import re, hashlib, json, zipfile
+          import pefile
+
+          root=Path("mupgrade_full")
+          out=Path("analysis")
+          out.mkdir(parents=True,exist_ok=True)
+
+          def sha(p):
+              h=hashlib.sha256()
+              with p.open("rb") as f:
+                  for b in iter(lambda:f.read(1024*1024),b""): h.update(b)
+              return h.hexdigest()
+
+          files=[]
+          for p in root.rglob("*"):
+              if p.is_file():
+                  files.append((str(p.relative_to(root)),p.stat().st_size,sha(p)))
+          files.sort()
+          with (out/"inventory.tsv").open("w",encoding="utf-8") as f:
+              for p,s,h in files: f.write(f"{s}\t{h}\t{p}\n")
+
+          strings_key=re.compile(
+              r"midi|sysex|sys.?ex|ota|upgrade|firmware|KPT|TANK|PRO|Sinco|"
+              r"E0000000|midiOut|midiIn|longmsg|shortmsg|ack|nak|checksum|crc|"
+              r"verify|boot|loader|dfu|device|version|product|model|usb|audio|"
+              r"vendor|pid|vid|message|packet|block|transfer|flash",
+              re.I)
+
+          def strings_ascii(b,n=4):
+              return [(m.start(),m.group().decode("ascii","ignore"))
+                      for m in re.finditer(rb"[ -~]{%d,}"%n,b)]
+          def strings_utf16(b,n=4):
+              pat=rb"(?:[ -~]\x00){%d,}"%n
+              ans=[]
+              for m in re.finditer(pat,b):
+                  try: ans.append((m.start(),m.group().decode("utf-16le","ignore")))
+                  except Exception: pass
+              return ans
+
+          with (out/"all_relevant_strings.tsv").open("w",encoding="utf-8",errors="ignore") as f:
+              for rel,size,h in files:
+                  p=root/rel
+                  try: data=p.read_bytes()
+                  except Exception: continue
+                  for off,s in strings_ascii(data)+strings_utf16(data):
+                      if strings_key.search(s):
+                          f.write(f"{rel}\t0x{off:X}\t{s}\n")
+
+          # PE report for every executable/DLL.
+          with (out/"pe_report.txt").open("w",encoding="utf-8",errors="ignore") as f:
+              for rel,size,h in files:
+                  p=root/rel
+                  if p.suffix.lower() not in {".exe",".dll",".ocx"}: continue
+                  try:
+                      pe=pefile.PE(str(p),fast_load=False)
+                      f.write(f"\n===== {rel} ({size} bytes) =====\n")
+                      f.write(f"Machine=0x{pe.FILE_HEADER.Machine:X} ImageBase=0x{pe.OPTIONAL_HEADER.ImageBase:X} EP=0x{pe.OPTIONAL_HEADER.AddressOfEntryPoint:X}\n")
+                      f.write("Imports:\n")
+                      try:
+                          for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                              dll=entry.dll.decode(errors="ignore")
+                              for imp in entry.imports:
+                                  nm=imp.name.decode(errors="ignore") if imp.name else f"ord_{imp.ordinal}"
+                                  f.write(f"{dll}\t{nm}\n")
+                      except Exception as e: f.write("IMPORT_ERROR "+repr(e)+"\n")
+                  except Exception as e:
+                      f.write(f"\n===== {rel} =====\nNOT_PE {e}\n")
+
+          # Focused EXE metadata and constant scan.
+          exe=root/"M-UPGRADE.exe"
+          if not exe.exists():
+              exes=list(root.rglob("M-UPGRADE.exe"))
+              exe=exes[0] if exes else None
+          if exe:
+              data=exe.read_bytes()
+              (out/"exe_hashes.txt").write_text(
+                  f"path={exe}\nsize={len(data)}\nSHA256={sha(exe)}\nMD5={hashlib.md5(data).hexdigest()}\n",
+                  encoding="utf-8")
+              pats={
+                  "E0000000_LE":bytes.fromhex("00 00 00 E0"),
+                  "E0000000_BE":bytes.fromhex("E0 00 00 00"),
+                  "E00000":bytes.fromhex("00 00 E0"),
+                  "MIDI":b"MIDI","SysEx":b"SysEx","Sinco":b"Sinco",
+                  "KPT":b"KPT","TANK":b"TANK","OTA":b"OTA","upgrade":b"upgrade",
+                  "midiOutLongMsg":b"midiOutLongMsg","midiOutShortMsg":b"midiOutShortMsg",
+                  "midiInAddBuffer":b"midiInAddBuffer"
+              }
+              with (out/"exe_byte_hits.txt").open("w") as f:
+                  for name,pat in pats.items():
+                      pos=[]; i=0
+                      while True:
+                          i=data.find(pat,i)
+                          if i<0: break
+                          pos.append(i); i+=1
+                      f.write(f"{name}\t{len(pos)}\t"+" ".join(hex(x) for x in pos[:500])+"\n")
+
+              key=re.compile(r"midi|sysex|ota|upgrade|firmware|KPT|TANK|Sinco|E000|ack|nak|checksum|crc|verify|boot|loader|device",re.I)
+              with (out/"exe_strings.tsv").open("w",encoding="utf-8",errors="ignore") as f:
+                  for off,s in strings_ascii(data)+strings_utf16(data):
+                      if key.search(s): f.write(f"0x{off:X}\t{s}\n")
+
+          # AppConfig and logs are extracted verbatim.
+          for p in list(root.rglob("*.ini")) + list(root.rglob("*.cfg")) + list(root.rglob("*.conf")):
+              try:
+                  (out/("config_"+p.name)).write_text(p.read_text("utf-8","replace"),encoding="utf-8")
+              except Exception: pass
+
+          lk=re.compile(r"midi|sysex|ota|upgrade|firmware|KPT|TANK|Sinco|E000|error|fail|success|ack|nak|checksum|verify|timeout|device|version|boot|loader|message|packet|block",re.I)
+          with (out/"logs_relevant.txt").open("w",encoding="utf-8",errors="ignore") as f:
+              for p in sorted(root.rglob("*.log")):
+                  try: text=p.read_text("utf-8","replace")
+                  except Exception: text=p.read_text(errors="replace")
+                  f.write("\n===== "+str(p.relative_to(root))+" =====\n")
+                  lines=text.splitlines()
+                  for i,line in enumerate(lines):
+                      if lk.search(line):
+                          for j in range(max(0,i-3),min(len(lines),i+4)):
+                              f.write(f"{j+1:6d}: {lines[j]}\n")
+
+          # ZIP member listing, to preserve the original package structure.
+          with zipfile.ZipFile("m upgrade.zip") as z:
+              with (out/"zip_inventory.txt").open("w",encoding="utf-8") as f:
+                  for info in z.infolist():
+                      f.write(f"{info.file_size}\t{info.compress_size}\t{info.filename}\n")
+
+          print("Static analysis complete")
+          PY
+          python3 analyze.py
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mupgrade-full-analysis
+          path: analysis/
+          if-no-files-found: error
