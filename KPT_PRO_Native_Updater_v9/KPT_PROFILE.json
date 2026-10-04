@@ -1,0 +1,16 @@
+{
+  "product": "KPT PRO",
+  "model_regex": "(?i)(?:ota-)?KPTPRO[_ -]([0-9]{1,4})",
+  "usb_vid": "0x3654",
+  "usb_pid": "0x7756",
+  "midi_interface": "MI_03",
+  "normal_name": "Sinco-Midi",
+  "hs_query": "F0 00 32 45 00 00 00 40 7F F7",
+  "upgrade_cmd": "F0 22 24 35 7F F7",
+  "verify_done": "0xE0000000",
+  "upgrade_done": "0xF0000000",
+  "max_chunk": 512,
+  "kpt_flash_size": "0x0F8000",
+  "fwsc_header_slots": 20,
+  "fwsc_slot_size": "0x30"
+}
