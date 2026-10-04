@@ -169,7 +169,108 @@ jobs:
           PY
           python3 analyze.py
 
-      - name: Upload report
+
+
+      - name: Deep OTA code and MIDI byte analysis
+        run: |
+          python3 -m pip install --disable-pip-version-check pefile capstone
+          cat > deep.py <<'PY'
+          from pathlib import Path
+          import re, pefile
+          from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_MODE_32, CS_OP_IMM, CS_OP_MEM, X86_REG_RIP
+
+          root=Path("mupgrade_full")
+          exe=root/"M-UPGRADE.exe"
+          out=Path("analysis")
+          data=exe.read_bytes()
+          pe=pefile.PE(str(exe),fast_load=False)
+          arch=CS_MODE_64 if pe.FILE_HEADER.Machine==0x8664 else CS_MODE_32
+          md=Cs(CS_ARCH_X86,arch); md.detail=True
+
+          text=None
+          for s in pe.sections:
+              if s.Name.rstrip(b"\\0")==b".text": text=s; break
+          if not text: raise SystemExit("no .text")
+          code=text.get_data()
+          base=pe.OPTIONAL_HEADER.ImageBase+text.VirtualAddress
+
+          def ascii_strings(b,n=4):
+              return [(m.start(),m.group().decode("ascii","ignore"))
+                      for m in re.finditer(rb"[ -~]{%d,}"%n,b)]
+          strs=ascii_strings(data)
+          rel=[]
+          for off,s in strs:
+              if re.search(r"OtaUpgradeWorker|Sending upgrade|Verification timeout|Sending data to device|Device request|MIDI preparation|upgrade mode|handshake|M_usb|verification passed|ota-KPTPRO|0xE0000000|isolated MIDI|upgrade completed",s,re.I):
+                  rva=None
+                  for sec in pe.sections:
+                      a=sec.PointerToRawData;b= a+sec.SizeOfRawData
+                      if a<=off<b:
+                          rva=pe.OPTIONAL_HEADER.ImageBase+sec.VirtualAddress+(off-a);break
+                  if rva: rel.append((rva,s,off))
+
+          ins=list(md.disasm(code,base))
+          by_addr={i.address:k for k,i in enumerate(ins)}
+          with (out/"ota_xrefs.txt").open("w",encoding="utf-8",errors="ignore") as f:
+              for target,s,off in rel:
+                  f.write(f"\\n### 0x{target:X} {s}\\n")
+                  found=0
+                  for idx,i in enumerate(ins):
+                      tgt=None
+                      for op in i.operands:
+                          if op.type==CS_OP_MEM and op.mem.base==X86_REG_RIP:
+                              tgt=i.address+i.size+op.mem.disp
+                          elif op.type==CS_OP_IMM:
+                              tgt=op.imm
+                          if tgt==target:
+                              found+=1
+                              f.write(f"ref 0x{i.address:X}: {i.mnemonic} {i.op_str}\\n")
+                              for x in ins[max(0,idx-35):idx+36]:
+                                  f.write(f"  0x{x.address:X}: {x.mnemonic} {x.op_str}\\n")
+                  f.write(f"refs={found}\\n")
+
+          # Report all literal SysEx markers with surrounding bytes from the raw EXE.
+          with (out/"sysex_byte_regions.txt").open("w") as f:
+              pats=[b"\\xF0",b"\\xF7",b"\\xE0\\x00\\x00\\x00",b"\\x00\\x00\\x00\\xE0"]
+              for p in pats:
+                  positions=[];pos=0
+                  while True:
+                      q=data.find(p,pos)
+                      if q<0: break
+                      positions.append(q);pos=q+1
+                  f.write(f"PATTERN {p.hex()} count={len(positions)}\\n")
+                  for q in positions[:300]:
+                      lo=max(0,q-32);hi=min(len(data),q+128)
+                      f.write(f"0x{q:X}: {data[lo:hi].hex(' ')}\\n")
+
+          # Resolve WINMM IAT and dump callers of MIDI APIs.
+          targets={}
+          try:
+              for e in pe.DIRECTORY_ENTRY_IMPORT:
+                  dll=e.dll.decode(errors="ignore")
+                  if dll.upper()=="WINMM.DLL":
+                      for x in e.imports:
+                          nm=x.name.decode(errors="ignore") if x.name else ""
+                          if "midi" in nm.lower():
+                              targets[nm]=x.address
+          except Exception: pass
+          with (out/"midi_api_callers.txt").open("w") as f:
+              for nm,t in targets.items():
+                  f.write(f"\\n### {nm} IAT=0x{t:X}\\n")
+                  for idx,i in enumerate(ins):
+                      if i.mnemonic=="call":
+                          target=None
+                          for op in i.operands:
+                              if op.type==CS_OP_MEM and op.mem.base==X86_REG_RIP:
+                                  target=i.address+i.size+op.mem.disp
+                          if target==t:
+                              f.write(f"CALL 0x{i.address:X} -> {nm}\\n")
+                              for x in ins[max(0,idx-25):idx+26]:
+                                  f.write(f"  0x{x.address:X}: {x.mnemonic} {x.op_str}\\n")
+
+          print("deep analysis complete")
+          PY
+          python3 deep.py
+\n      - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: mupgrade-full-analysis
